@@ -15,6 +15,7 @@ const router = express.Router();
 const upload = multer();
 
 const lastJobHealAt = new Map();
+const lastMergeHealAt = new Map();
 
 async function selfHealJobIfStalled(job) {
   try {
@@ -40,6 +41,11 @@ async function selfHealJobIfStalled(job) {
     // This also covers the case where the job was marked failed even though progress is 100%.
     if (pagesAreDone) {
       if (!job.outputDocumentId) {
+        const now = Date.now();
+        const lastMergeAt = lastMergeHealAt.get(jobId) || 0;
+        if (now - lastMergeAt < 60_000) return;
+        lastMergeHealAt.set(jobId, now);
+
         const mergeJobId = `${jobId}-merge`;
         const existing = await mergePdfQueue.getJob(mergeJobId).catch(() => null);
 
@@ -56,7 +62,12 @@ async function selfHealJobIfStalled(job) {
           return;
         }
 
-        await mergePdfQueue.add('mergeJob', { jobId }, { jobId: mergeJobId });
+        await mergePdfQueue.add('mergeJob', { jobId }, {
+          jobId: mergeJobId,
+          attempts: 1,
+          removeOnComplete: true,
+          removeOnFail: true,
+        });
       }
       return;
     }
