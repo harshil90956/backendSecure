@@ -2,12 +2,17 @@
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 🔥 ENV LOAD FIRST (ONLY ONCE)
-dotenv.config({ path: path.resolve(__dirname, "../.env") });
+// ENV: load from process env (Railway/Render/etc.), then optionally override from local ../.env if present.
+dotenv.config();
+const envPath = path.resolve(__dirname, "../.env");
+if (fs.existsSync(envPath)) {
+  dotenv.config({ path: envPath, override: true });
+}
 
 import mongoose from "mongoose";
 import crypto from "crypto";
@@ -166,15 +171,27 @@ async function start() {
       if (!jobId) return;
 
       try {
+        log("▶ merge start", jobId);
         const jobDoc = await DocumentJobs.findById(jobId);
-        if (!jobDoc) return;
+        if (!jobDoc) {
+          log("[merge] jobDoc not found", jobId);
+          return;
+        }
+
+        // Best-effort mark as merging so UI matches reality.
+        await DocumentJobs.findByIdAndUpdate(jobId, {
+          $set: { status: "processing", stage: "merging" },
+        }).catch(() => null);
 
         const merged = await PDFDocument.create();
         const pages = [...jobDoc.pageArtifacts].sort(
           (a, b) => a.pageIndex - b.pageIndex
         );
 
+        log("[merge] pageArtifacts", { jobId, count: pages.length });
+
         for (const p of pages) {
+          log("[merge] downloading page", { jobId, pageIndex: p.pageIndex, key: p.key });
           const res = await s3.send(
             new GetObjectCommand({
               Bucket: process.env.AWS_S3_BUCKET,
@@ -183,7 +200,10 @@ async function start() {
           );
           const chunks = [];
           for await (const c of res.Body) chunks.push(c);
-          const pdf = await PDFDocument.load(Buffer.concat(chunks));
+          const buf = Buffer.concat(chunks);
+          log("[merge] downloaded bytes", { jobId, pageIndex: p.pageIndex, bytes: buf.length });
+
+          const pdf = await PDFDocument.load(buf);
           const copied = await merged.copyPages(
             pdf,
             pdf.getPageIndices()
@@ -192,11 +212,14 @@ async function start() {
         }
 
         const finalPdf = Buffer.from(await merged.save());
+        log("[merge] final pdf bytes", { jobId, bytes: finalPdf.length });
         const { key, url } = await uploadToS3(
           finalPdf,
           "application/pdf",
           "generated/output/"
         );
+
+        log("[merge] uploaded output", { jobId, key });
 
         const doc = await Document.create({
           title: "Generated Output",
@@ -227,7 +250,15 @@ async function start() {
           },
         });
 
+        log("✅ merge completed", { jobId, outputDocumentId: doc._id?.toString?.() });
+
       } catch (err) {
+        console.error("❌ merge error", {
+          jobId,
+          message: err && err.message,
+          name: err && err.name,
+          stack: err && err.stack,
+        });
         await DocumentJobs.findByIdAndUpdate(jobId, {
           $set: { status: "failed", stage: "failed" },
         });
