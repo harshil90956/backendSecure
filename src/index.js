@@ -175,8 +175,20 @@ app.get('/api/queue-failures', async (req, res) => {
 });
 
 async function ensureAdminUser() {
-  const adminEmail = 'akshit@gmail.com';
-  const adminPassword = 'akshit';
+  const seedEnabledRaw = typeof process.env.SEED_ADMIN === 'string' ? process.env.SEED_ADMIN.trim().toLowerCase() : '';
+  const seedEnabled = seedEnabledRaw === 'true' || seedEnabledRaw === '1' || seedEnabledRaw === 'yes' || seedEnabledRaw === 'y';
+
+  if (!seedEnabled) {
+    return;
+  }
+
+  const adminEmail = typeof process.env.ADMIN_EMAIL === 'string' ? process.env.ADMIN_EMAIL.trim() : '';
+  const adminPassword = typeof process.env.ADMIN_PASSWORD === 'string' ? process.env.ADMIN_PASSWORD : '';
+
+  if (!adminEmail || !adminPassword) {
+    console.error('Admin seeding enabled but ADMIN_EMAIL / ADMIN_PASSWORD missing');
+    return;
+  }
 
   const existing = await User.findOne({ email: adminEmail.toLowerCase() });
   if (existing) {
@@ -197,12 +209,14 @@ async function ensureAdminUser() {
 
 async function start() {
   try {
-    const mongoUri =
-      process.env.MONGO_URI ||
-      'mongodb+srv://gajeraakshit53_db_user:lvbGcIFW0ul5Bao6@akshit.thyfwea.mongodb.net/securepdf?retryWrites=true&w=majority';
+    const mongoUri = typeof process.env.MONGO_URI === 'string' ? process.env.MONGO_URI.trim() : '';
 
     if (!mongoUri) {
-      console.error('MONGO_URI is not set in environment');
+      if (process.env.NODE_ENV === 'development') {
+        console.error('MONGO_URI is not set in environment (required)');
+      } else {
+        console.error('MONGO_URI is not set in environment (required in production)');
+      }
       process.exit(1);
     }
 

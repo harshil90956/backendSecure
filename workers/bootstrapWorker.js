@@ -1,11 +1,17 @@
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config({ path: path.resolve(__dirname, '../.env') });
+dotenv.config();
+
+const envPath = path.resolve(__dirname, '../.env');
+if (fs.existsSync(envPath)) {
+  dotenv.config({ path: envPath, override: true });
+}
 
 process.on('unhandledRejection', (reason) => {
   console.error('[bootstrapWorker] unhandledRejection', reason);
