@@ -54,14 +54,15 @@ router.post('/documents', authMiddleware, requireAdmin, upload.single('file'), a
       return res.status(400).json({ message: 'File is required' });
     }
 
-    if (!title || !totalPrints) {
-      return res.status(400).json({ message: 'Title and totalPrints are required' });
+    if (!title) {
+      return res.status(400).json({ message: 'Title is required' });
     }
 
-    const parsedTotal = Number(totalPrints);
-    if (Number.isNaN(parsedTotal) || parsedTotal <= 0) {
-      return res.status(400).json({ message: 'totalPrints must be a positive number' });
+    const parsedTotalRaw = totalPrints === undefined || totalPrints === null ? 0 : Number(totalPrints);
+    if (!Number.isFinite(parsedTotalRaw) || parsedTotalRaw < 0) {
+      return res.status(400).json({ message: 'totalPrints must be a non-negative number' });
     }
+    const parsedTotal = parsedTotalRaw;
 
     const { key, url } = await uploadToS3(file.buffer, file.mimetype);
 
