@@ -19,10 +19,9 @@ const documentSchema = new mongoose.Schema(
       required: true,
     },
 
-    // 🔐 IMPORTANT: quota / prints
+    // 🔐 Print quota (system-managed)
     totalPrints: {
       type: Number,
-      required: true,
       default: 0,
       min: 0,
     },
