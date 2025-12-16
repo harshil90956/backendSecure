@@ -110,6 +110,27 @@ async function start() {
   console.log("🚀 PDF Worker booting...");
   await connectMongo();
 
+  try {
+    dbg("boot", "", "build", {
+      railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA,
+      commitSha: process.env.COMMIT_SHA,
+      nodeEnv: process.env.NODE_ENV,
+    });
+
+    const tp = Document?.schema?.path?.("totalPrints");
+    dbg("boot", "", "Document.totalPrints schema", {
+      required: tp?.isRequired === true || tp?.options?.required === true,
+      hasDefault: tp?.options?.default !== undefined,
+      default: tp?.options?.default,
+      min: tp?.options?.min,
+    });
+  } catch (e) {
+    dbg("boot", "", "boot debug failed", {
+      message: e && e.message,
+      name: e && e.name,
+    });
+  }
+
   // ==================================================
   // RENDER WORKER
   // ==================================================
