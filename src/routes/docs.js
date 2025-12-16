@@ -15,7 +15,6 @@ const router = express.Router();
 const upload = multer();
 
 const lastJobHealAt = new Map();
-const lastMergeHealAt = new Map();
 
 async function selfHealJobIfStalled(job) {
   try {
@@ -40,35 +39,6 @@ async function selfHealJobIfStalled(job) {
     // 1) If all pages are rendered but merge/output is missing, retry/enqueue merge
     // This also covers the case where the job was marked failed even though progress is 100%.
     if (pagesAreDone) {
-      if (!job.outputDocumentId) {
-        const now = Date.now();
-        const lastMergeAt = lastMergeHealAt.get(jobId) || 0;
-        if (now - lastMergeAt < 60_000) return;
-        lastMergeHealAt.set(jobId, now);
-
-        const mergeJobId = `${jobId}-merge`;
-        const existing = await mergePdfQueue.getJob(mergeJobId).catch(() => null);
-
-        // Reset to processing so UI doesn't stay on "Failed" while we retry merge.
-        await DocumentJobs.findByIdAndUpdate(jobId, {
-          $set: { status: 'processing', stage: 'merging' },
-        }).catch(() => null);
-
-        if (existing) {
-          const state = await existing.getState().catch(() => null);
-          if (state === 'failed') {
-            await existing.retry().catch(() => null);
-          }
-          return;
-        }
-
-        await mergePdfQueue.add('mergeJob', { jobId }, {
-          jobId: mergeJobId,
-          attempts: 1,
-          removeOnComplete: true,
-          removeOnFail: true,
-        });
-      }
       return;
     }
 
@@ -211,14 +181,15 @@ router.post('/upload', authMiddleware, upload.single('file'), async (req, res) =
       return res.status(400).json({ message: 'File is required' });
     }
 
-    if (!title || !totalPrints) {
-      return res.status(400).json({ message: 'Title and totalPrints are required' });
+    if (!title) {
+      return res.status(400).json({ message: 'Title is required' });
     }
 
-    const parsedTotal = Number(totalPrints);
-    if (Number.isNaN(parsedTotal) || parsedTotal <= 0) {
-      return res.status(400).json({ message: 'totalPrints must be a positive number' });
+    const parsedTotalRaw = totalPrints === undefined || totalPrints === null ? 0 : Number(totalPrints);
+    if (!Number.isFinite(parsedTotalRaw) || parsedTotalRaw < 0) {
+      return res.status(400).json({ message: 'totalPrints must be a non-negative number' });
     }
+    const parsedTotal = parsedTotalRaw;
 
     const { key, url } = await uploadToS3(file.buffer, file.mimetype, 'securepdf/');
 
