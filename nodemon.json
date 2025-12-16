@@ -1,0 +1,14 @@
+{
+  "watch": ["src", "queues", "workers"],
+  "ext": "js,json",
+  "ignore": [
+    "node_modules/**",
+    "../frontend/**",
+    "../desktop/**",
+    "../dist/**",
+    "../build/**",
+    "../out/**",
+    "*.log"
+  ],
+  "delay": "200"
+}
