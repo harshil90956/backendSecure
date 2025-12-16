@@ -178,6 +178,15 @@ async function start() {
           return;
         }
 
+        if (jobDoc.outputDocumentId || jobDoc.stage === "completed") {
+          log("[merge] already completed, skipping", {
+            jobId,
+            outputDocumentId: jobDoc.outputDocumentId?.toString?.(),
+            stage: jobDoc.stage,
+          });
+          return;
+        }
+
         // Best-effort mark as merging so UI matches reality.
         await DocumentJobs.findByIdAndUpdate(jobId, {
           $set: { status: "processing", stage: "merging" },
@@ -221,10 +230,15 @@ async function start() {
 
         log("[merge] uploaded output", { jobId, key });
 
+        const totalPrintsRaw = jobDoc.assignedQuota;
+        const totalPrintsNum = Number(totalPrintsRaw ?? 0);
+        const totalPrints = Number.isFinite(totalPrintsNum) ? totalPrintsNum : 0;
+
         const doc = await Document.create({
           title: "Generated Output",
           fileKey: key,
           fileUrl: url,
+          totalPrints,
           mimeType: "application/pdf",
           documentType: "generated-output",
           createdBy: jobDoc.createdBy,
