@@ -1,42 +1,52 @@
 // workers/pdfWorker.js
 import dotenv from "dotenv";
 import path from "path";
-import fs from "fs";
 import { fileURLToPath } from "url";
+import fs from "fs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ENV: load from process env (Railway/Render/etc.), then optionally override from local ../.env if present.
+dotenv.config();
+const envPath = path.resolve(__dirname, "../.env");
+if (fs.existsSync(envPath)) {
+  dotenv.config({ path: envPath, override: true });
+}
 
 import mongoose from "mongoose";
 import crypto from "crypto";
 import { Worker } from "bullmq";
 import { PDFDocument } from "pdf-lib";
-import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 
-import { connection, mergePdfQueue } from "../queues/outputPdfQueue.js";
+import {
+  connection,
+  mergePdfQueue,
+} from "../queues/outputPdfQueue.js";
+
 import { generateOutputPdfBuffer } from "../src/pdf/generateOutputPdf.js";
 import { s3, uploadToS3 } from "../src/services/s3.js";
-
 import Document from "../src/models/Document.js";
 import DocumentAccess from "../src/models/DocumentAccess.js";
 import DocumentJobs from "../src/models/DocumentJobs.js";
 
-/* -------------------------------------------------- */
-/* ENV */
-/* -------------------------------------------------- */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-dotenv.config();
-const envPath = path.resolve(__dirname, "../.env");
-if (fs.existsSync(envPath)) dotenv.config({ path: envPath, override: true });
-
+// 🔥 DEBUG
 const debug =
   process.env.WORKER_DEBUG === "1" ||
   process.env.WORKER_DEBUG === "true";
 
 const log = (...a) => debug && console.log(...a);
 
-/* -------------------------------------------------- */
-/* Mongo */
-/* -------------------------------------------------- */
+const dbg = (scope, jobId, ...a) => {
+  if (!debug) return;
+  const prefix = typeof jobId === "string" && jobId.length ? `[${scope}] ${jobId}` : `[${scope}]`;
+  console.log(prefix, ...a);
+};
+
+// --------------------------------------------------
+// Mongo
+// --------------------------------------------------
 async function connectMongo() {
   if (!process.env.MONGO_URI) {
     console.error("❌ MONGO_URI missing");
@@ -51,9 +61,9 @@ async function connectMongo() {
   console.log("🟢 Mongo connected");
 }
 
-/* -------------------------------------------------- */
-/* Resolve s3:// images */
-/* -------------------------------------------------- */
+// --------------------------------------------------
+// Resolve s3:// images
+// --------------------------------------------------
 async function resolveS3ImagesInLayout(layout) {
   if (!process.env.AWS_S3_BUCKET) return layout;
 
@@ -62,12 +72,11 @@ async function resolveS3ImagesInLayout(layout) {
 
   const cache = new Map();
 
-  const resolvedItems = await Promise.all(
+  const resolved = await Promise.all(
     items.map(async (item) => {
       if (!item?.src?.startsWith("s3://")) return item;
 
       const key = item.src.replace("s3://", "");
-
       if (!cache.has(key)) {
         const res = await s3.send(
           new GetObjectCommand({
@@ -78,10 +87,9 @@ async function resolveS3ImagesInLayout(layout) {
 
         const chunks = [];
         for await (const c of res.Body) chunks.push(c);
-
         const buf = Buffer.concat(chunks);
-        const type = res.ContentType || "image/png";
 
+        const type = res.ContentType || "image/png";
         cache.set(
           key,
           `data:${type};base64,${buf.toString("base64")}`
@@ -92,173 +100,367 @@ async function resolveS3ImagesInLayout(layout) {
     })
   );
 
-  return { ...layout, items: resolvedItems };
+  return { ...layout, items: resolved };
 }
 
-/* -------------------------------------------------- */
-/* START */
-/* -------------------------------------------------- */
+// --------------------------------------------------
+// START
+// --------------------------------------------------
 async function start() {
-  console.log("🚀 PDF Worker starting...");
+  console.log("🚀 PDF Worker booting...");
   await connectMongo();
 
-  /* ===================== RENDER WORKER ===================== */
+  // ==================================================
+  // RENDER WORKER
+  // ==================================================
   new Worker(
-    "outputPdfQueue",
+    "outputPdfQueue", // 🔥 HARD-CODED (NO MISMATCH)
     async (job) => {
       const { jobId, pageLayout, pageIndex } = job.data;
       if (!jobId) return;
 
-      const jobDoc = await DocumentJobs.findById(jobId);
-      if (!jobDoc) return;
+      try {
+        log("▶ render start", jobId, pageIndex);
 
-      if (
-        jobDoc.outputDocumentId ||
-        jobDoc.stage === "completed" ||
-        jobDoc.stage === "merging"
-      ) {
-        return;
-      }
+        const jobDoc = await DocumentJobs.findById(jobId);
+        if (!jobDoc) return;
 
-      const layout = await resolveS3ImagesInLayout(pageLayout);
-      const pdf = await generateOutputPdfBuffer([layout]);
-      if (!pdf?.length) throw new Error("Empty PDF");
+        if (jobDoc.outputDocumentId || jobDoc.stage === "completed") {
+          dbg("render", jobId, "skip: already completed", {
+            stage: jobDoc.stage,
+            status: jobDoc.status,
+            outputDocumentId: jobDoc.outputDocumentId?.toString?.(),
+          });
+          return;
+        }
+        if (jobDoc.stage === "merging") {
+          dbg("render", jobId, "skip: already merging", {
+            stage: jobDoc.stage,
+            status: jobDoc.status,
+          });
+          return;
+        }
 
-      const { key } = await uploadToS3(
-        pdf,
-        "application/pdf",
-        "generated/pages/"
-      );
+        const layout = await resolveS3ImagesInLayout(pageLayout);
+        const pdf = await generateOutputPdfBuffer([layout]);
+        if (!pdf?.length) throw new Error("Empty PDF");
 
-      const updated = await DocumentJobs.findByIdAndUpdate(
-        jobId,
-        {
-          $inc: { completedPages: 1 },
-          $push: { pageArtifacts: { key, pageIndex } },
-          $set: { status: "processing", stage: "rendering" },
-        },
-        { new: true }
-      );
+        const { key } = await uploadToS3(
+          pdf,
+          "application/pdf",
+          "generated/pages/"
+        );
 
-      if (
-        updated.completedPages >= updated.totalPages &&
-        updated.totalPages > 0
-      ) {
-        const transitioned = await DocumentJobs.findOneAndUpdate(
+        const setFields = { status: "processing" };
+        if (jobDoc.stage !== "merging" && jobDoc.stage !== "completed") {
+          setFields.stage = "rendering";
+        }
+
+        const updated = await DocumentJobs.findByIdAndUpdate(
+          jobId,
           {
-            _id: jobId,
-            outputDocumentId: null,
-            stage: { $in: ["pending", "rendering"] },
+            $inc: { completedPages: 1 },
+            $push: { pageArtifacts: { key, pageIndex } },
+            $set: setFields,
           },
-          { $set: { status: "processing", stage: "merging" } },
           { new: true }
         );
 
-        if (!transitioned) return;
+        dbg("render", jobId, "page uploaded", {
+          pageIndex,
+          key,
+          completedPages: updated?.completedPages,
+          totalPages: updated?.totalPages,
+          stage: updated?.stage,
+          status: updated?.status,
+        });
 
-        try {
-          await mergePdfQueue.add(
-            "mergeJob",
-            { jobId },
+        if (
+          updated.completedPages >= updated.totalPages &&
+          updated.totalPages > 0
+        ) {
+          dbg("render", jobId, "render complete: attempting merge transition", {
+            completedPages: updated.completedPages,
+            totalPages: updated.totalPages,
+            stage: updated.stage,
+            status: updated.status,
+          });
+
+          const transitioned = await DocumentJobs.findOneAndUpdate(
             {
-              jobId: `${jobId}-merge`,
-              attempts: 1,
-              removeOnComplete: true,
-              removeOnFail: true,
-            }
+              _id: jobId,
+              outputDocumentId: null,
+              stage: { $in: ["pending", "rendering"] },
+            },
+            { $set: { status: "processing", stage: "merging" } },
+            { new: true }
           );
-        } catch (e) {
-          if (String(e?.message).toLowerCase().includes("already exists")) return;
-          throw e;
+
+          if (!transitioned) {
+            dbg("render", jobId, "merge transition skipped (already transitioned or completed)");
+            return;
+          }
+
+          try {
+            await mergePdfQueue.add(
+              "mergeJob",
+              { jobId },
+              {
+                jobId: `${jobId}-merge`,
+                attempts: 1,
+                removeOnComplete: true,
+                removeOnFail: true,
+              }
+            );
+            dbg("render", jobId, "merge enqueued", { mergeJobId: `${jobId}-merge` });
+          } catch (e) {
+            const msg = e && e.message ? String(e.message) : "";
+            if (msg.toLowerCase().includes("already exists")) {
+              dbg("render", jobId, "merge enqueue ignored: jobId already exists", {
+                mergeJobId: `${jobId}-merge`,
+              });
+              return;
+            }
+            throw e;
+          }
         }
+
+      } catch (err) {
+        console.error("❌ render error", err.message);
+        await DocumentJobs.findByIdAndUpdate(jobId, {
+          $set: { status: "failed", stage: "failed" },
+        });
+        throw err;
       }
     },
     { connection, concurrency: 4 }
   );
 
-  /* ===================== MERGE WORKER ===================== */
+  // ==================================================
+  // MERGE WORKER
+  // ==================================================
   new Worker(
     "mergePdfQueue",
     async (job) => {
       const { jobId } = job.data;
       if (!jobId) return;
 
-      const jobDoc = await DocumentJobs.findOneAndUpdate(
-        {
-          _id: jobId,
-          outputDocumentId: null,
-          stage: { $ne: "completed" },
-        },
-        { $set: { status: "processing", stage: "merging" } },
-        { new: true }
-      );
+      try {
+        dbg("merge", jobId, "start", {
+          bullmqJobId: job?.id,
+          attemptsMade: job?.attemptsMade,
+          data: job?.data,
+        });
 
-      if (!jobDoc) return;
+        const jobDoc = await DocumentJobs.findById(jobId);
+        if (!jobDoc) {
+          dbg("merge", jobId, "jobDoc not found");
+          return;
+        }
 
-      const merged = await PDFDocument.create();
-      const pages = [...jobDoc.pageArtifacts].sort(
-        (a, b) => a.pageIndex - b.pageIndex
-      );
+        dbg("merge", jobId, "job snapshot", {
+          stage: jobDoc.stage,
+          status: jobDoc.status,
+          totalPages: jobDoc.totalPages,
+          completedPages: jobDoc.completedPages,
+          outputDocumentId: jobDoc.outputDocumentId?.toString?.(),
+          assignedQuota: jobDoc.assignedQuota,
+          artifacts: Array.isArray(jobDoc.pageArtifacts) ? jobDoc.pageArtifacts.length : 0,
+          createdBy: jobDoc.createdBy?.toString?.(),
+          userId: jobDoc.userId?.toString?.(),
+        });
 
-      for (const p of pages) {
-        const res = await s3.send(
-          new GetObjectCommand({
-            Bucket: process.env.AWS_S3_BUCKET,
-            Key: p.key,
-          })
+        if (jobDoc.outputDocumentId || jobDoc.stage === "completed") {
+          dbg("merge", jobId, "already completed, skipping", {
+            jobId,
+            outputDocumentId: jobDoc.outputDocumentId?.toString?.(),
+            stage: jobDoc.stage,
+          });
+          return;
+        }
+
+        // Best-effort mark as merging so UI matches reality.
+        await DocumentJobs.findByIdAndUpdate(jobId, {
+          $set: { status: "processing", stage: "merging" },
+        }).catch(() => null);
+
+        const merged = await PDFDocument.create();
+        const pages = [...jobDoc.pageArtifacts].sort(
+          (a, b) => a.pageIndex - b.pageIndex
         );
 
-        const chunks = [];
-        for await (const c of res.Body) chunks.push(c);
+        const totalPages = Number(jobDoc.totalPages ?? 0);
+        const artifactPageIndexes = new Set(
+          pages.map((p) => p?.pageIndex).filter((v) => Number.isInteger(v))
+        );
+        const missing = [];
+        if (Number.isFinite(totalPages) && totalPages > 0) {
+          for (let i = 0; i < totalPages; i += 1) {
+            if (!artifactPageIndexes.has(i)) missing.push(i);
+          }
+        }
 
-        const pdf = await PDFDocument.load(Buffer.concat(chunks));
-        const copied = await merged.copyPages(pdf, pdf.getPageIndices());
-        copied.forEach(pg => merged.addPage(pg));
+        dbg("merge", jobId, "artifacts validation", {
+          artifactsSorted: pages.length,
+          totalPages,
+          uniqueArtifactPages: artifactPageIndexes.size,
+          missingCount: missing.length,
+          missing: missing.length ? missing.slice(0, 20) : [],
+        });
+
+        if (Number.isFinite(totalPages) && totalPages > 0 && missing.length) {
+          throw new Error(
+            `Missing rendered page artifacts for indexes: ${missing.slice(0, 50).join(",")}`
+          );
+        }
+
+        for (const p of pages) {
+          const pageIndex = p?.pageIndex;
+          const key = p?.key;
+          dbg("merge", jobId, "page start", { pageIndex, key });
+
+          if (!process.env.AWS_S3_BUCKET) {
+            throw new Error("AWS_S3_BUCKET missing in worker env");
+          }
+
+          try {
+            const head = await s3
+              .send(
+                new HeadObjectCommand({
+                  Bucket: process.env.AWS_S3_BUCKET,
+                  Key: key,
+                })
+              )
+              .catch(() => null);
+            if (head) {
+              dbg("merge", jobId, "page head", {
+                pageIndex,
+                key,
+                contentLength: head.ContentLength,
+                contentType: head.ContentType,
+                lastModified: head.LastModified,
+              });
+            }
+          } catch (e) {
+            dbg("merge", jobId, "page head failed", {
+              pageIndex,
+              key,
+              message: e && e.message,
+            });
+          }
+
+          const res = await s3.send(
+            new GetObjectCommand({
+              Bucket: process.env.AWS_S3_BUCKET,
+              Key: key,
+            })
+          );
+          const chunks = [];
+          for await (const c of res.Body) chunks.push(c);
+          const buf = Buffer.concat(chunks);
+          dbg("merge", jobId, "page downloaded", { pageIndex, key, bytes: buf.length });
+
+          if (!buf?.length) {
+            throw new Error(`Downloaded empty PDF buffer for pageIndex=${pageIndex} key=${key}`);
+          }
+
+          let pdf;
+          try {
+            pdf = await PDFDocument.load(buf);
+          } catch (e) {
+            dbg("merge", jobId, "PDF load failed", {
+              pageIndex,
+              key,
+              message: e && e.message,
+              name: e && e.name,
+            });
+            throw e;
+          }
+
+          const indices = pdf.getPageIndices();
+          dbg("merge", jobId, "PDF loaded", { pageIndex, key, pages: indices.length });
+
+          let copied;
+          try {
+            copied = await merged.copyPages(pdf, indices);
+          } catch (e) {
+            dbg("merge", jobId, "copyPages failed", {
+              pageIndex,
+              key,
+              message: e && e.message,
+              name: e && e.name,
+            });
+            throw e;
+          }
+
+          copied.forEach((pg) => merged.addPage(pg));
+        }
+
+        const finalPdf = Buffer.from(await merged.save());
+        dbg("merge", jobId, "final pdf", { bytes: finalPdf.length });
+        const { key, url } = await uploadToS3(
+          finalPdf,
+          "application/pdf",
+          "generated/output/"
+        );
+
+        dbg("merge", jobId, "uploaded output", { key, url });
+
+        const totalPrintsRaw = jobDoc.assignedQuota;
+        const totalPrintsNum = Number(totalPrintsRaw ?? 0);
+        const totalPrints = Number.isFinite(totalPrintsNum) ? totalPrintsNum : 0;
+
+        const doc = await Document.create({
+          title: "Generated Output",
+          fileKey: key,
+          fileUrl: url,
+          totalPrints,
+          mimeType: "application/pdf",
+          documentType: "generated-output",
+          createdBy: jobDoc.createdBy,
+        });
+
+        const access = await DocumentAccess.findOneAndUpdate(
+          { userId: jobDoc.userId, documentId: doc._id },
+          {
+            userId: jobDoc.userId,
+            documentId: doc._id,
+            assignedQuota: Number(jobDoc.assignedQuota),
+            usedPrints: 0,
+            sessionToken: crypto.randomBytes(32).toString("hex"),
+          },
+          { upsert: true, new: true }
+        );
+
+        await DocumentJobs.findByIdAndUpdate(jobId, {
+          $set: {
+            status: "completed",
+            stage: "completed",
+            outputDocumentId: doc._id,
+          },
+        });
+
+        log("✅ merge completed", { jobId, outputDocumentId: doc._id?.toString?.() });
+
+      } catch (err) {
+        console.error("❌ merge error", {
+          jobId,
+          message: err && err.message,
+          name: err && err.name,
+          stack: err && err.stack,
+        });
+
+        dbg("merge", jobId, "merge failed", {
+          bullmqJobId: job?.id,
+          attemptsMade: job?.attemptsMade,
+          data: job?.data,
+        });
+
+        await DocumentJobs.findByIdAndUpdate(jobId, {
+          $set: { status: "failed", stage: "failed" },
+        });
+        throw err;
       }
-
-      const finalPdf = Buffer.from(await merged.save());
-
-      const { key, url } = await uploadToS3(
-        finalPdf,
-        "application/pdf",
-        "generated/output/"
-      );
-
-      const totalPrints = Number.isFinite(Number(jobDoc.assignedQuota))
-        ? Number(jobDoc.assignedQuota)
-        : 0;
-
-      const doc = await Document.create({
-        title: "Generated Output",
-        fileKey: key,
-        fileUrl: url,
-        totalPrints,
-        mimeType: "application/pdf",
-        documentType: "generated-output",
-        createdBy: jobDoc.createdBy,
-      });
-
-      await DocumentAccess.findOneAndUpdate(
-        { userId: jobDoc.userId, documentId: doc._id },
-        {
-          userId: jobDoc.userId,
-          documentId: doc._id,
-          assignedQuota: totalPrints,
-          usedPrints: 0,
-          sessionToken: crypto.randomBytes(32).toString("hex"),
-        },
-        { upsert: true }
-      );
-
-      await DocumentJobs.findByIdAndUpdate(jobId, {
-        $set: {
-          status: "completed",
-          stage: "completed",
-          outputDocumentId: doc._id,
-        },
-      });
-
-      log("✅ merge completed", jobId);
     },
     { connection, concurrency: 1 }
   );
