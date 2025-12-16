@@ -33,10 +33,10 @@ export const outputPdfQueue = new Queue(OUTPUT_PDF_QUEUE_NAME, {
 export const mergePdfQueue = new Queue(MERGE_PDF_QUEUE_NAME, {
   connection,
   defaultJobOptions: {
-    attempts: 2,
+    attempts: 1,
     backoff: { type: "fixed", delay: 5000 },
     removeOnComplete: true,
-    removeOnFail: false,
+    removeOnFail: true,
   },
 });
 
