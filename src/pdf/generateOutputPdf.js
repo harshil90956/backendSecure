@@ -4,11 +4,6 @@ import puppeteer from 'puppeteer';
 const A4_WIDTH_PX = 794;
 const A4_HEIGHT_PX = 1123;
 
-const rawDeviceScaleFactor = Number(process.env.PDF_DEVICE_SCALE_FACTOR || 3);
-const DEVICE_SCALE_FACTOR = Number.isFinite(rawDeviceScaleFactor)
-  ? Math.max(1, Math.min(6, rawDeviceScaleFactor))
-  : 3;
-
 const debugEnabled =
   process.env.WORKER_DEBUG === '1' ||
   process.env.WORKER_DEBUG === 'true' ||
@@ -95,11 +90,7 @@ export async function generateOutputPdfBuffer(pages) {
       }
     }
 
-    await page.setViewport({
-      width: A4_WIDTH_PX,
-      height: A4_HEIGHT_PX,
-      deviceScaleFactor: DEVICE_SCALE_FACTOR,
-    });
+    await page.setViewport({ width: A4_WIDTH_PX, height: A4_HEIGHT_PX, deviceScaleFactor: 1 });
     // Disable navigation timeout so large/complex pages can finish rendering
     page.setDefaultNavigationTimeout(0);
 
@@ -158,35 +149,22 @@ function escapeHtml(str = '') {
 }
 
 function buildHtml(pages = []) {
-  const PX_TO_MM = 25.4 / 96;
-  const PT_TO_MM = 25.4 / 72;
-
-  const toMm = (value, unit) => {
-    const n = Number(value);
-    const safe = Number.isFinite(n) ? n : 0;
-    return unit === 'mm' ? safe : safe * PX_TO_MM;
-  };
-
-  const formatMm = (value, unit) => `${toMm(value, unit)}mm`;
-
   const pageDivs = pages
     .map((page) => {
       const itemsHtml = (page.items || [])
         .map((item) => {
           if (item.type === 'image') {
             const src = item.src || '';
-            const unit = item.unit === 'mm' || page.unit === 'mm' ? 'mm' : 'px';
             return `
               <img
                 src="${src}"
-                style="position:absolute; left:${formatMm(item.x, unit)}; top:${formatMm(item.y, unit)}; width:${formatMm(item.width, unit)}; height:${formatMm(item.height, unit)};"
+                style="position:absolute; left:${item.x}px; top:${item.y}px; width:${item.width}px; height:${item.height}px; object-fit:contain;"
               />
             `;
           }
 
           if (item.type === 'text') {
             const rawText = item.text || '';
-            const unit = item.unit === 'mm' || page.unit === 'mm' ? 'mm' : 'px';
             const baseFontSize = item.fontSize || 12;
             const fontFamily = item.fontFamily || 'Arial, sans-serif';
             const color = item.color || '#000';
@@ -205,24 +183,20 @@ function buildHtml(pages = []) {
                   const safeChar = ch === ' ' ? '&nbsp;' : escapeHtml(ch);
                   const size = item.letterFontSizes[idx] || baseFontSize;
                   const offsetY = hasOffsets ? item.letterOffsets[idx] || 0 : 0;
-                  const cumulativeSpacing = spacingAfterArray
+                  const cumulativeSpacingPt = spacingAfterArray
                     ? spacingAfterArray
                         .slice(0, idx)
                         .reduce((sum, v) => sum + (Number(v) || 0), 0)
                     : 0;
+                  const cumulativeX = cumulativeSpacingPt * (96 / 72);
 
-                  const sizeMm = toMm(size, unit);
-                  const offsetYmm = toMm(offsetY, unit);
-                  // Legacy payloads used points for spacingAfterX, then converted pt->px (96/72).
-                  // New payloads send mm directly. We always emit mm in CSS.
-                  const cumulativeMm = unit === 'mm' ? cumulativeSpacing : cumulativeSpacing * PT_TO_MM;
-                  return `<span style="font-size:${sizeMm}mm; font-family:${fontFamily}; white-space:pre; display:inline-block; transform: translate(${cumulativeMm}mm, ${offsetYmm}mm);">${safeChar}</span>`;
+                  return `<span style="font-size:${size}px; font-family:${fontFamily}; white-space:pre; display:inline-block; transform: translate(${cumulativeX}px, ${offsetY}px);">${safeChar}</span>`;
                 })
                 .join('');
 
               return `
               <div
-                style="position:absolute; left:${formatMm(item.x, unit)}; top:${formatMm(item.y, unit)}; font-size:${toMm(baseFontSize, unit)}mm; font-family:${fontFamily}; color:${color}; white-space:pre;"
+                style="position:absolute; left:${item.x}px; top:${item.y}px; font-size:${baseFontSize}px; font-family:${fontFamily}; color:${color}; white-space:pre;"
               >${lettersHtml}</div>
             `;
             }
@@ -230,7 +204,7 @@ function buildHtml(pages = []) {
             const text = escapeHtml(rawText);
             return `
               <div
-                style="position:absolute; left:${formatMm(item.x, unit)}; top:${formatMm(item.y, unit)}; font-size:${toMm(baseFontSize, unit)}mm; font-family:${fontFamily}; color:${color}; white-space:pre;"
+                style="position:absolute; left:${item.x}px; top:${item.y}px; font-size:${baseFontSize}px; font-family:${fontFamily}; color:${color}; white-space:pre;"
               >${text}</div>
             `;
           }
@@ -258,16 +232,15 @@ function buildHtml(pages = []) {
           html, body {
             margin: 0;
             padding: 0;
-            width: 210mm;
-            height: 297mm;
+            width: ${A4_WIDTH_PX}px;
           }
           body {
             background: white;
           }
           .page {
             position: relative;
-            width: 210mm;
-            height: 297mm;
+            width: ${A4_WIDTH_PX}px;
+            height: ${A4_HEIGHT_PX}px;
             page-break-after: always;
             overflow: hidden;
           }
