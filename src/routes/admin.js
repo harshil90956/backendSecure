@@ -2,11 +2,14 @@ import express from 'express';
 import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import mongoose from 'mongoose';
 import User from '../models/User.js';
 import Document from '../models/Document.js';
 import DocumentAccess from '../models/DocumentAccess.js';
 import DocumentJobs from '../models/DocumentJobs.js';
-import { uploadToS3 } from '../services/s3.js';
+import { s3, uploadToS3 } from '../services/s3.js';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { PDFDocument } from 'pdf-lib';
 import { outputPdfQueue } from '../../queues/outputPdfQueue.js';
 import { redisEnabled } from '../redisAvailability.js';
 import { authMiddleware, requireAdmin } from '../middleware/auth.js';
@@ -107,15 +110,37 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
     }
 
     // Safety: ensure layoutPages only contain lightweight S3 references, no base64 blobs
-    const sanitizedLayoutPages = layoutPages.map((page) => ({
-      items: Array.isArray(page.items)
-        ? page.items.map((item) => ({
-            ...item,
-            // Expecting src like "s3://<key>". We trust frontend to send only small strings.
-            src: typeof item.src === 'string' ? item.src : '',
-          }))
-        : [],
-    }));
+    const sanitizedLayoutPages = layoutPages.map((page) => {
+      const layoutMode =
+        page && typeof page.layoutMode === 'string' ? page.layoutMode : 'raster';
+
+      return {
+        layoutMode,
+        items: Array.isArray(page.items)
+          ? page.items.map((item) => {
+              if (item && item.type === 'image') {
+                return {
+                  ...item,
+                  // Expecting src like "s3://<key>". We trust frontend to send only small strings.
+                  src: typeof item.src === 'string' ? item.src : '',
+                };
+              }
+
+              if (item && item.type === 'text') {
+                return { ...item };
+              }
+
+              // Vector layout items (e.g. { kind: 'svgTemplate' | 'text' | ... })
+              // Keep them lightweight but do not mutate shape.
+              if (item && typeof item === 'object') {
+                return { ...item };
+              }
+
+              return item;
+            })
+          : [],
+      };
+    });
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) {
@@ -157,6 +182,10 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
         const layoutMode =
           pageLayout && typeof pageLayout.layoutMode === 'string' ? pageLayout.layoutMode : 'raster';
 
+        // Extract page size from layout or default to A4
+        const pageWidthMm = pageLayout?.pageWidthMm || 210;
+        const pageHeightMm = pageLayout?.pageHeightMm || 297;
+
         const payload = {
           jobId: jobDoc._id.toString(),
           documentJobId: jobDoc._id.toString(),
@@ -165,6 +194,8 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
           totalPages,
           pageLayout,
           layoutMode,
+          pageWidthMm,
+          pageHeightMm,
           assignedQuota: pagesNum,
           adminUserId: req.user._id,
           s3TemplateKey: null,
@@ -215,6 +246,130 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
       });
     }
 
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+router.post('/assign-batch-range', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const { email, documentId, startPage, endPage } = req.body || {};
+
+    if (!email || !documentId || startPage === undefined || endPage === undefined) {
+      return res.status(400).json({ message: 'email, documentId, startPage and endPage are required' });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(String(documentId))) {
+      return res.status(400).json({ message: 'Invalid documentId' });
+    }
+
+    const start = Number(startPage);
+    const end = Number(endPage);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end <= 0 || end < start) {
+      return res.status(400).json({ message: 'Invalid page range' });
+    }
+
+    const bucket = process.env.AWS_S3_BUCKET;
+    if (!bucket) {
+      return res.status(500).json({ message: 'S3 not configured' });
+    }
+
+    const user = await User.findOne({ email: String(email).toLowerCase() });
+    if (!user) {
+      return res.status(404).json({ message: 'User with this email not found' });
+    }
+
+    const srcDoc = await Document.findById(documentId);
+    if (!srcDoc || !srcDoc.fileKey) {
+      return res.status(404).json({ message: 'Source document not found' });
+    }
+
+    if (typeof srcDoc.mimeType === 'string' && srcDoc.mimeType.trim() && !srcDoc.mimeType.toLowerCase().includes('pdf')) {
+      return res.status(400).json({ message: 'Source document must be a PDF' });
+    }
+
+    let s3Res;
+    try {
+      s3Res = await s3.send(
+        new GetObjectCommand({
+          Bucket: bucket,
+          Key: srcDoc.fileKey,
+        })
+      );
+    } catch (err) {
+      const statusCode = err?.$metadata?.httpStatusCode;
+      const errName = err?.name;
+      if (statusCode === 404 || errName === 'NoSuchKey' || errName === 'NotFound') {
+        return res.status(404).json({ message: 'Source PDF not found in S3' });
+      }
+      throw err;
+    }
+
+    if (!s3Res || !s3Res.Body) {
+      return res.status(500).json({ message: 'Failed to read source document bytes' });
+    }
+
+    const chunks = [];
+    for await (const c of s3Res.Body) chunks.push(c);
+    const pdfBuffer = Buffer.concat(chunks);
+
+    let pdf;
+    try {
+      pdf = await PDFDocument.load(pdfBuffer);
+    } catch {
+      return res.status(400).json({ message: 'Invalid PDF file' });
+    }
+    const pageCount = pdf.getPageCount();
+    if (start > pageCount || end > pageCount) {
+      return res.status(400).json({ message: `Page range exceeds document page count (${pageCount})` });
+    }
+
+    const outPdf = await PDFDocument.create();
+    const indices = [];
+    for (let i = start - 1; i <= end - 1; i += 1) indices.push(i);
+
+    const copiedPages = await outPdf.copyPages(pdf, indices);
+    copiedPages.forEach((p) => outPdf.addPage(p));
+
+    const outBytes = await outPdf.save();
+    const outBuffer = Buffer.from(outBytes);
+
+    const { key, url } = await uploadToS3(outBuffer, 'application/pdf', 'generated/batch/');
+
+    const outDoc = await Document.create({
+      title: 'Generated Output',
+      fileKey: key,
+      fileUrl: url,
+      totalPrints: 0,
+      createdBy: req.user._id,
+      mimeType: 'application/pdf',
+      documentType: 'generated-output',
+    });
+
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    const assignedQuota = end - start + 1;
+
+    await DocumentAccess.create({
+      userId: user._id,
+      documentId: outDoc._id,
+      assignedQuota,
+      usedPrints: 0,
+      sessionToken,
+    });
+
+    return res.status(201).json({
+      success: true,
+      documentId: outDoc._id,
+      documentTitle: outDoc.title,
+      sessionToken,
+      assignedQuota,
+    });
+  } catch (err) {
+    console.error('assign-batch-range error', err);
+    const statusCode = err?.$metadata?.httpStatusCode;
+    const errName = err?.name;
+    if (statusCode === 403 || errName === 'AccessDenied') {
+      return res.status(500).json({ message: 'S3 access denied. Check AWS credentials and bucket permissions.' });
+    }
     return res.status(500).json({ message: 'Internal server error' });
   }
 });
