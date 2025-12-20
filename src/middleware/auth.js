@@ -6,7 +6,6 @@ import BlockedIp from '../models/BlockedIp.js';
 const normalizeIp = (value) => {
   if (!value || typeof value !== 'string') return '';
   const first = value.split(',')[0].trim();
-  if (first === '::1') return '127.0.0.1';
   if (first.startsWith('::ffff:')) return first.slice('::ffff:'.length);
   return first;
 };
@@ -102,7 +101,8 @@ export const authMiddleware = async (req, res, next) => {
 };
 
 export const requireAdmin = (req, res, next) => {
-  if (!req.user || req.user.role !== 'admin') {
+  const role = req.user?.role;
+  if (!req.user || (role !== 'admin' && role !== 'ADMIN')) {
     return res.status(403).json({ message: 'Admin access required' });
   }
   next();
