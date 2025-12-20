@@ -103,191 +103,6 @@ async function resolveS3ImagesInLayout(layout) {
   return { ...layout, items: resolved };
 }
 
-const A4_WIDTH_MM = 210;
-const A4_HEIGHT_MM = 297;
-const PT_PER_MM = 72 / 25.4;
-const PX_TO_PT = 72 / 96;
-
-const A4_WIDTH_PT = A4_WIDTH_MM * PT_PER_MM;
-const A4_HEIGHT_PT = A4_HEIGHT_MM * PT_PER_MM;
-const TICKETS_PER_PAGE = 4;
-const TICKET_HEIGHT_MM = A4_HEIGHT_MM / TICKETS_PER_PAGE;
-const TICKET_HEIGHT_PT = TICKET_HEIGHT_MM * PT_PER_MM;
-
-const svgServiceUrl =
-  process.env.SVG_TO_PDF_SERVICE_URL ||
-  process.env.SVG_TO_PDF_SERVICE ||
-  process.env.SVG_TO_PDF_URL ||
-  "http://localhost:3000";
-
-const vectorEnabled =
-  process.env.ENABLE_VECTOR_OUTPUT === "1" ||
-  process.env.ENABLE_VECTOR_OUTPUT === "true" ||
-  process.env.ENABLE_VECTOR_OUTPUT === "yes";
-
-const hasFetchStack =
-  typeof fetch === "function" &&
-  typeof FormData === "function" &&
-  typeof Blob === "function" &&
-  typeof AbortController === "function";
-
-const vectorEnabledEffective = vectorEnabled && hasFetchStack;
-
-async function downloadS3Buffer(key) {
-  if (!process.env.AWS_S3_BUCKET) {
-    throw new Error("AWS_S3_BUCKET missing in worker env");
-  }
-
-  const res = await s3.send(
-    new GetObjectCommand({
-      Bucket: process.env.AWS_S3_BUCKET,
-      Key: key,
-    })
-  );
-
-  const chunks = [];
-  for await (const c of res.Body) chunks.push(c);
-  return Buffer.concat(chunks);
-}
-
-async function convertSvgBufferToCmykPdf(svgBuffer, cropPercent) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-  try {
-    const form = new FormData();
-    form.append(
-      "file",
-      new Blob([svgBuffer], { type: "image/svg+xml" }),
-      "input.svg"
-    );
-    if (cropPercent) {
-      form.append("crop", JSON.stringify(cropPercent));
-    }
-
-    const res = await fetch(`${svgServiceUrl}/svg-to-pdf-cmyk`, {
-      method: "POST",
-      body: form,
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`svg-to-pdf-service error (${res.status}): ${text}`);
-    }
-
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-function extractDocumentIdFromTemplateKey(templateKey) {
-  if (typeof templateKey !== "string") return null;
-  if (!templateKey.startsWith("document:")) return null;
-  const id = templateKey.slice("document:".length).trim();
-  return id || null;
-}
-
-async function renderVectorLayoutToPdfBuffer(layout) {
-  const items = Array.isArray(layout?.items) ? layout.items : [];
-  const templateItem = items.find((i) => i && i.kind === "svgTemplate");
-  if (!templateItem) {
-    throw new Error("vector layout missing svgTemplate");
-  }
-
-  const docId = extractDocumentIdFromTemplateKey(templateItem.templateKey);
-  if (!docId) {
-    throw new Error("vector templateKey missing document id");
-  }
-
-  const srcDoc = await Document.findById(docId);
-  if (!srcDoc) {
-    throw new Error("source document not found");
-  }
-
-  const mimeType = typeof srcDoc.mimeType === "string" ? srcDoc.mimeType : "";
-  const isSvg =
-    mimeType.includes("svg") ||
-    (typeof srcDoc.fileKey === "string" && srcDoc.fileKey.toLowerCase().endsWith(".svg"));
-
-  if (!isSvg) {
-    throw new Error("vector mode currently requires SVG source");
-  }
-
-  const svgBuffer = await downloadS3Buffer(srcDoc.fileKey);
-  if (!svgBuffer?.length) {
-    throw new Error("empty SVG buffer");
-  }
-
-  const cropPercent = templateItem.ticketRegion || null;
-  const ticketPdfBuffer = await convertSvgBufferToCmykPdf(svgBuffer, cropPercent);
-
-  const ticketPdf = await PDFDocument.load(ticketPdfBuffer);
-  const [embeddedTicket] = await ticketPdf.embedPages([ticketPdf.getPage(0)]);
-
-  const out = await PDFDocument.create();
-  const page = out.addPage([A4_WIDTH_PT, A4_HEIGHT_PT]);
-
-  const scaleX = A4_WIDTH_PT / embeddedTicket.width;
-  const scaleY = TICKET_HEIGHT_PT / embeddedTicket.height;
-  const scale = Math.min(scaleX, scaleY);
-  const drawW = embeddedTicket.width * scale;
-  const drawH = embeddedTicket.height * scale;
-  const x = (A4_WIDTH_PT - drawW) / 2;
-
-  for (let i = 0; i < TICKETS_PER_PAGE; i += 1) {
-    const ticketBottomYpt = A4_HEIGHT_PT - (i + 1) * TICKET_HEIGHT_PT;
-    page.drawPage(embeddedTicket, {
-      x,
-      y: ticketBottomYpt + (TICKET_HEIGHT_PT - drawH) / 2,
-      xScale: scale,
-      yScale: scale,
-    });
-  }
-
-  for (const item of items) {
-    if (!item || item.kind !== "text") continue;
-
-    const rawText = typeof item.text === "string" ? item.text : "";
-    if (!rawText) continue;
-
-    const unit = item.unit === 'mm' || layout?.unit === 'mm' ? 'mm' : 'px';
-    const xRaw = Number(item.x) || 0;
-    const yRaw = Number(item.y) || 0;
-    const sizeRaw = Number(item.fontSize) || 12;
-
-    const xPt = unit === 'mm' ? xRaw * PT_PER_MM : xRaw * PX_TO_PT;
-    const yPt = A4_HEIGHT_PT - (unit === 'mm' ? yRaw * PT_PER_MM : yRaw * PX_TO_PT);
-    const sizePt = unit === 'mm' ? sizeRaw * PT_PER_MM : sizeRaw * PX_TO_PT;
-
-    page.drawText(rawText, {
-      x: xPt,
-      y: yPt,
-      size: sizePt,
-    });
-  }
-
-  return Buffer.from(await out.save());
-}
-
-async function validatePdfIsA4(pdfBuffer) {
-  const pdfDoc = await PDFDocument.load(pdfBuffer);
-  const pages = pdfDoc.getPages();
-  const p0 = pages && pages.length ? pages[0] : null;
-  if (!p0) return { ok: false, reason: 'missing_page' };
-
-  const w = p0.getWidth();
-  const h = p0.getHeight();
-
-  const eps = 0.05;
-  const okPortrait = Math.abs(w - A4_WIDTH_PT) <= eps && Math.abs(h - A4_HEIGHT_PT) <= eps;
-  const okLandscape = Math.abs(w - A4_HEIGHT_PT) <= eps && Math.abs(h - A4_WIDTH_PT) <= eps;
-  const ok = okPortrait || okLandscape;
-  return { ok, widthPt: w, heightPt: h, eps };
-}
-
 // --------------------------------------------------
 // START
 // --------------------------------------------------
@@ -322,7 +137,7 @@ async function start() {
   new Worker(
     "outputPdfQueue", // 🔥 HARD-CODED (NO MISMATCH)
     async (job) => {
-      const { jobId, pageLayout, pageIndex, layoutMode } = job.data;
+      const { jobId, pageLayout, pageIndex } = job.data;
       if (!jobId) return;
 
       try {
@@ -347,46 +162,9 @@ async function start() {
           return;
         }
 
-        let pdf;
-        if (layoutMode === "vector" && vectorEnabledEffective) {
-          try {
-            pdf = await renderVectorLayoutToPdfBuffer(pageLayout);
-          } catch (e) {
-            dbg("render", jobId, "vector render failed; falling back to raster", {
-              pageIndex,
-              message: e && e.message,
-              name: e && e.name,
-            });
-            const layout = await resolveS3ImagesInLayout(pageLayout);
-            pdf = await generateOutputPdfBuffer([layout]);
-          }
-        } else {
-          const layout = await resolveS3ImagesInLayout(pageLayout);
-          pdf = await generateOutputPdfBuffer([layout]);
-        }
+        const layout = await resolveS3ImagesInLayout(pageLayout);
+        const pdf = await generateOutputPdfBuffer([layout]);
         if (!pdf?.length) throw new Error("Empty PDF");
-
-        try {
-          const v = await validatePdfIsA4(pdf);
-          dbg('render', jobId, 'pdf_size_check', {
-            pageIndex,
-            ok: v?.ok === true,
-            widthPt: v?.widthPt,
-            heightPt: v?.heightPt,
-            expectedWidthPt: A4_WIDTH_PT,
-            expectedHeightPt: A4_HEIGHT_PT,
-            eps: v?.eps,
-          });
-          if (!v || v.ok !== true) {
-            throw new Error('Generated PDF is not exact A4');
-          }
-        } catch (e) {
-          dbg('render', jobId, 'pdf_size_check_failed', {
-            pageIndex,
-            message: e && e.message,
-          });
-          throw e;
-        }
 
         const { key } = await uploadToS3(
           pdf,
